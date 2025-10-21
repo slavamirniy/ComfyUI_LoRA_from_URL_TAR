@@ -1,6 +1,9 @@
 import os
 import hashlib
 import requests
+import tarfile
+import tempfile
+from urllib.parse import urlparse
 import folder_paths
 import comfy.utils
 import comfy.sd
@@ -28,30 +31,95 @@ class LoadLoraFromURL:
     CATEGORY = "loaders"
 
     def download_if_needed(self, url):
-        """Download the file if not in cache"""
-        filename = hashlib.md5(url.encode()).hexdigest() + ".safetensors"
-        local_path = os.path.join(self.cache_dir, filename)
-        
-        if os.path.exists(local_path):
-            return local_path
-            
+        """Download the file or extract from a .tar if needed and return a local .safetensors path"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        url_path = urlparse(url).path.lower()
+
+        is_tar = url_path.endswith('.tar') or url_path.endswith('.tar.gz') or url_path.endswith('.tgz')
+
+        # Cache target is always a .safetensors file for loading
+        safetensors_filename = f"{url_hash}.safetensors" if not is_tar else f"{url_hash}_flux-lora.safetensors"
+        safetensors_local_path = os.path.join(self.cache_dir, safetensors_filename)
+
+        if os.path.exists(safetensors_local_path):
+            return safetensors_local_path
+
         print(f"Downloading LoRA from {url}")
         response = requests.get(url, stream=True)
         response.raise_for_status()
-        
+
         total_size = int(response.headers.get('content-length', 0))
-        
-        with open(local_path, 'wb') as f, tqdm(
-            desc=filename,
-            total=total_size,
-            unit='iB',
-            unit_scale=True
-        ) as pbar:
-            for data in response.iter_content(chunk_size=8192):
-                size = f.write(data)
-                pbar.update(size)
-                
-        return local_path
+
+        if not is_tar:
+            # Direct .safetensors download
+            with open(safetensors_local_path, 'wb') as f, tqdm(
+                desc=safetensors_filename,
+                total=total_size,
+                unit='iB',
+                unit_scale=True
+            ) as pbar:
+                for data in response.iter_content(chunk_size=8192):
+                    size = f.write(data)
+                    pbar.update(size)
+            return safetensors_local_path
+
+        # .tar download and selective extract of flux-lora/flux-lora.safetensors
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_archive:
+            tmp_archive_path = tmp_archive.name
+            with tqdm(
+                desc=os.path.basename(urlparse(url).path) or f"{url_hash}.tar",
+                total=total_size,
+                unit='iB',
+                unit_scale=True
+            ) as pbar:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        tmp_archive.write(chunk)
+                        pbar.update(len(chunk))
+
+        try:
+            # Open tar and find target file
+            with tarfile.open(tmp_archive_path, 'r:*') as tar:
+                members = tar.getmembers()
+                # Prefer exact path
+                target_member = None
+                for m in members:
+                    if m.isfile() and m.name.replace('\\', '/').endswith('flux-lora/flux-lora.safetensors'):
+                        target_member = m
+                        break
+                # Fallback: any .safetensors inside a directory named flux-lora
+                if target_member is None:
+                    for m in members:
+                        if not m.isfile():
+                            continue
+                        normalized = m.name.replace('\\', '/')
+                        parts = normalized.split('/')
+                        if any(part == 'flux-lora' for part in parts[:-1]) and parts[-1].endswith('.safetensors'):
+                            target_member = m
+                            break
+
+                if target_member is None:
+                    raise FileNotFoundError("Target 'flux-lora/flux-lora.safetensors' not found in archive")
+
+                # Extract only the target file into the cache path
+                extracted_file = tar.extractfile(target_member)
+                if extracted_file is None:
+                    raise FileNotFoundError("Unable to extract target file from archive")
+
+                with open(safetensors_local_path, 'wb') as out_f:
+                    while True:
+                        chunk = extracted_file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+
+            return safetensors_local_path
+        finally:
+            try:
+                os.remove(tmp_archive_path)
+            except Exception:
+                # Best-effort cleanup
+                pass
 
     def load_lora(self, url, model, strength):
         try:
