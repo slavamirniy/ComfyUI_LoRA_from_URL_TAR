@@ -136,3 +136,8 @@ class LoadLoraFromURL:
         except Exception as e:
             print(f"Error loading LoRA: {str(e)}")
             return (model,)
+
+# ComfyUI node display name mapping
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "LoadLoraFromURL": "Load Flux LoRA from URL/TAR",
+}
